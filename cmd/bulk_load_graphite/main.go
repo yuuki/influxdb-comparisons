@@ -25,19 +25,20 @@ import (
 
 // Program option vars:
 var (
-	carbonUrl           string
-	graphiteUrl         string
-	workers             int
-	batchSize           int
-	backoff             time.Duration
-	stallThreshold      time.Duration
-	doLoad              bool
-	reportDatabase      string
-	reportHost          string
-	reportUser          string
-	reportPassword      string
-	reportTagsCSV       string
-	file                string
+	carbonUrl      string
+	graphiteUrl    string
+	workers        int
+	batchSize      int
+	backoff        time.Duration
+	stallThreshold time.Duration
+	maxRunTime     time.Duration
+	doLoad         bool
+	reportDatabase string
+	reportHost     string
+	reportUser     string
+	reportPassword string
+	reportTagsCSV  string
+	file           string
 )
 
 // Global vars
@@ -46,6 +47,7 @@ var (
 	batchChan      chan *bytes.Buffer
 	batchChanLines chan []string
 	inputDone      chan struct{}
+	stopChan       chan struct{}
 	reportTags     [][2]string
 	reportHostname string
 	format         string
@@ -74,6 +76,7 @@ func init() {
 	flag.IntVar(&workers, "workers", 1, "Number of parallel requests to make.")
 	flag.DurationVar(&backoff, "backoff", 1*time.Second, "Time to sleep between requests when server indicates stall is needed.")
 	flag.DurationVar(&stallThreshold, "stall-threshold", 100*time.Millisecond, "Amount of time that represents relay stall.")
+	flag.DurationVar(&maxRunTime, "max-run-time", 0, "")
 
 	flag.BoolVar(&doLoad, "do-load", true, "Whether to write data. Set this flag to false to check input read speed.")
 
@@ -141,10 +144,10 @@ func main() {
 		}
 	}
 
-
 	batchChan = make(chan *bytes.Buffer, workers)
 	batchChanLines = make(chan []string, workers)
 	inputDone = make(chan struct{})
+	stopChan = make(chan struct{})
 
 	var workersGroup sync.WaitGroup
 	procs := processes[format]
@@ -187,6 +190,14 @@ func main() {
 			procReads[ind] = procs.process(connection)
 		}(i, conn)
 	}
+
+	go func() {
+		if maxRunTime == 0 {
+			return
+		}
+		time.Sleep(maxRunTime)
+		close(stopChan)
+	}()
 
 	start := time.Now()
 	itemsRead, bytesRead, valuesRead := procs.scan(batchSize, sourceReader)
@@ -240,7 +251,15 @@ func scan(itemsPerBatch int, reader io.Reader) (int64, int64, int64) {
 	newline := []byte("\n")
 	scanner := bufio.NewScanner(bufio.NewReaderSize(reader, 4*1024*1024))
 
+L:
 	for scanner.Scan() {
+		select {
+		case <-stopChan:
+			log.Println("stopping benchmark.")
+			break L
+		default:
+		}
+
 		line := scanner.Text()
 		if strings.HasPrefix(line, common.DatasetSizeMarker) {
 			parts := common.DatasetSizeMarkerRE.FindAllStringSubmatch(line, -1)
@@ -285,8 +304,8 @@ func scan(itemsPerBatch int, reader io.Reader) (int64, int64, int64) {
 	// Closing inputDone signals to the application that we've read everything and can now shut down.
 	close(inputDone)
 
-	if linesRead != /*totalPoints*/totalValues { // Graphite line protocol has one value per line
-		log.Fatalf("Incorrent number of read points: %d, expected: %d:", linesRead, /*totalPoints*/totalValues)
+	if totalValues != 0 && linesRead != /*totalPoints*/ totalValues { // Graphite line protocol has one value per line
+		log.Fatalf("Incorrent number of read points: %d, expected: %d:", linesRead /*totalPoints*/, totalValues)
 	}
 
 	// The graphite format uses 1 line per item:
@@ -376,8 +395,8 @@ func scanLine(itemsPerBatch int, reader io.Reader) (int64, int64, int64) {
 	// Closing inputDone signals to the application that we've read everything and can now shut down.
 	close(inputDone)
 
-	if linesRead != /*totalPoints*/totalValues { // Graphite line protocol has one value per line
-		log.Fatalf("Incorrent number of read points: %d, expected: %d:", linesRead, /*totalPoints*/totalValues)
+	if linesRead != /*totalPoints*/ totalValues { // Graphite line protocol has one value per line
+		log.Fatalf("Incorrent number of read points: %d, expected: %d:", linesRead /*totalPoints*/, totalValues)
 	}
 
 	// The graphite format uses 1 line per item:
